@@ -1,0 +1,127 @@
+apiVersion: v1
+kind: BuildConfig
+metadata:
+  name: blah-blah-ci-cd-pipeline
+  labels:
+    name: blah-blah-ci-cd-pipeline
+spec:
+  runPolicy: Serial
+  source:
+    type: None
+  strategy:
+    type: JenkinsPipeline
+    jenkinsPipelineStrategy:
+      jenkinsfile: |-
+        #!groovy
+
+        // Global Variables
+        properties([
+            [$class: 'ParametersDefinitionProperty', parameterDefinitions: [
+                [$class: 'StringParameterDefinition', name: 'APP_NAME', defaultValue: 'blah-blah', description: "Application Name - all resources use this name as a label"],
+                [$class: 'StringParameterDefinition', name: 'GIT_URL', defaultValue: 'https://github.com/clarkie82/blah-blah.git', description: "Project Git URL)"],
+                [$class: 'StringParameterDefinition', name: 'GIT_BRANCH', defaultValue: 'master', description: "Git Branch (from Multibranch plugin if being used)"],
+                [$class: 'StringParameterDefinition', name: 'SCM_CRED', defaultValue: 'GitRepo', description: "Credentials to Git Repo stored in Jenkins"],
+                [$class: 'StringParameterDefinition', name: 'DEV_PROJECT', defaultValue: 'dev', description: "Name of the Development namespace"],
+                [$class: 'StringParameterDefinition', name: 'DEV_REPLICA_COUNT', defaultValue: '1', description: "Number of development pods we desire"],
+                [$class: 'StringParameterDefinition', name: 'DEV_TAG', defaultValue: 'latest', description: "Development tag"],                
+                [$class: 'StringParameterDefinition', name: 'TEST_PROJECT', defaultValue: 'test', description: "Name of the Test namespace"],
+                [$class: 'StringParameterDefinition', name: 'TEST_REPLICA_COUNT', defaultValue: '1', description: "Number of test pods we desire"],
+                [$class: 'StringParameterDefinition', name: 'TEST_TAG', defaultValue: 'test', description: "Test tag"],
+                [$class: 'StringParameterDefinition', name: 'MAVEN_MIRROR', defaultValue: 'http://nexus.ci-cd.svc.cluster.local:8081/repository/heritage.snapshot/', description: "Maven Mirror located in OCP Cluster"],
+            ]]
+        ])
+
+        // jenkins environment variables
+        echo "Build Number is: ${env.BUILD_NUMBER}"
+        echo "Branch name is: ${GIT_BRANCH}"
+        echo "Git URL is: ${GIT_URL}"
+
+        // we need the short name as well
+        def depC="${APP_NAME}"
+        if (depC.length() > 24){
+            depC = depC.substring(0,24)
+        }
+        
+        try {
+          timeout(time: 20, unit: 'MINUTES') {
+
+            node("maven") {
+
+              stage("Configuration") {
+                // maven cache configuration (change mirror host)
+                sh "sed -i \"s|<!-- ### configured mirrors ### -->|<mirror><id>mirror.default</id><url>${MAVEN_MIRROR}</url><mirrorOf>external:*</mirrorOf></mirror>|\" /home/jenkins/.m2/settings.xml"
+              }
+
+              stage("Checkout") {
+                // git scm credentials required
+                checkout([$class: 'GitSCM',
+                          branches: [[name: "*/${GIT_BRANCH}"]],
+                          userRemoteConfigs: [[url: "${GIT_URL}", credentialsId:"${SCM_CRED}"]]
+                        ]);
+              }
+
+              stage("Deploy to Development") {
+                sh "mvn clean fabric8:deploy -Dfabric8.namespace=${DEV_PROJECT}"
+              }
+
+              stage("Scale in Development") {
+                openshiftScale(namespace: "${DEV_PROJECT}",
+                               depCfg: "${depC}",
+                               waitTime: '300000',
+                               replicaCount: "${DEV_REPLICA_COUNT}")
+                                
+                openshiftVerifyDeployment(namespace: "${DEV_PROJECT}",
+                                          depCfg: "${depC}",
+                                          replicaCount: "${DEV_REPLICA_COUNT}",
+                                          verifyReplicaCount: 'true',
+                                          waitTime: '300000')
+              }
+
+              stage("Create Route in Development") {
+                sh "oc expose -n ${DEV_PROJECT} svc ${depC} || echo 'Service already exposed'"
+              }
+
+              stage("Deploy to Test") {
+                def testImage = "docker-registry.default.svc:5000" + '\\/' + "${TEST_PROJECT}" + '\\/' + "${APP_NAME}:${TEST_TAG}"
+                def patch1 = $/oc export dc,svc,secret -n "${DEV_PROJECT}" -l project="${APP_NAME}" --as-template="${APP_NAME}"-template | oc process -f- | sed -e $'s/\"image\":.*/\"image\": \"${testImage}\",/' -e $'s/\"namespace\":.*/\"namespace\": \"${TEST_PROJECT}\"/' | sed -e $'s/\"name\": \"${APP_NAME}:${DEV_TAG}\",/\"name\": \"${APP_NAME}:${TEST_TAG}\",/' | oc apply --force -n "${TEST_PROJECT}" -f- /$
+                sh patch1
+
+                openshiftTag(namespace: "${DEV_PROJECT}",
+                             sourceStream: "${APP_NAME}",
+                             sourceTag: "${DEV_TAG}",
+                             destinationNamespace: "${TEST_PROJECT}",
+                             destinationStream: "${APP_NAME}",
+                             destinationTag: "${TEST_TAG}")
+              }
+
+              stage("Scale in Test") {
+                openshiftScale(namespace: "${TEST_PROJECT}",
+                               depCfg: "${depC}",
+                               waitTime: '300000',
+                               replicaCount: "${TEST_REPLICA_COUNT}")
+                                
+                openshiftVerifyDeployment(namespace: "${TEST_PROJECT}",
+                                          depCfg: "${depC}",
+                                          replicaCount: "${TEST_REPLICA_COUNT}",
+                                          verifyReplicaCount: 'true',
+                                          waitTime: '300000')
+              }
+
+              stage("Create Route in Test") {
+                sh "oc expose -n ${TEST_PROJECT} svc ${depC} || echo 'Service already exposed'"
+              }
+            }
+          }
+        } catch (err) {
+          echo "in catch block"
+          echo "Caught: ${err}"
+          currentBuild.result = 'FAILURE'
+          throw err
+        }  
+  triggers:
+    - github:
+        secret: secret101
+      type: GitHub
+    - generic:
+        secret: secret101
+      type: Generic

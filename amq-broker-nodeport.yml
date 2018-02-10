@@ -1,0 +1,95 @@
+apiVersion: v1
+kind: BuildConfig
+metadata:
+  name: amq-broker-with-nodeports-pipeline
+  labels:
+    name: amq-broker-with-nodeports-pipeline
+spec:
+  runPolicy: Serial
+  source:
+    type: None
+  strategy:
+    type: JenkinsPipeline
+    jenkinsPipelineStrategy:
+      jenkinsfile: |-
+        #!groovy
+
+        // Global Variables
+        properties([
+          [$class: 'ParametersDefinitionProperty', parameterDefinitions: [
+            [$class: 'StringParameterDefinition', name: 'APP_NAME', defaultValue: 'amq63-basic', description: "Application Name"],
+            [$class: 'StringParameterDefinition', name: 'DEPLOY_NAME', defaultValue: 'broker-amq', description: "Deployment Config Name"],
+            [$class: 'StringParameterDefinition', name: 'APP_USERNAME', defaultValue: 'admin', description: "Defeault app username across all projects"],
+            [$class: 'StringParameterDefinition', name: 'APP_PASSWORD', defaultValue: 'admin', description: "Default app password across all projects"],
+            [$class: 'StringParameterDefinition', name: 'DEV_PROJECT', defaultValue: 'dev', description: "Dev Project Name"],
+            [$class: 'StringParameterDefinition', name: 'DEV_PORT', defaultValue: '32320', description: "Dev Project Application NodePort"],
+            [$class: 'StringParameterDefinition', name: 'TEST_PROJECT', defaultValue: 'test', description: "Test Project Name"],
+            [$class: 'StringParameterDefinition', name: 'TEST_PORT', defaultValue: '32321', description: "Test Project Application NodePort"],
+            [$class: 'StringParameterDefinition', name: 'STAGE_PROJECT', defaultValue: 'stage', description: "Stage Project Name"],
+            [$class: 'StringParameterDefinition', name: 'STAGE_PORT', defaultValue: '32322', description: "Stage Project Application NodePort"]
+            ]]
+        ])
+
+        // OpenShift has a 24 character limit for the deployment name
+        if (APP_NAME.length() > 24){
+          APP_NAME = APP_NAME.substring(0,24)
+        }
+
+        // function to create the nodeports in each environment
+        def deploy_and_createnodeport(env,nodeport) {
+          // deploy - pass in the APP_USERNAME and APP_PASSWORD to this function if you want to use different ones per environment (though these should be in secrets, which I will fix up later
+          sh "oc new-app --template=${APP_NAME} -p MQ_USERNAME=${APP_USERNAME} -p MQ_PASSWORD=${APP_PASSWORD} -n ${env} || echo '${DEPLOY_NAME} already exists in ${env}'"
+          // create nodeport json
+          def json = """
+                       apiVersion: v1
+                       kind: service
+                       metadata:
+                         creationTimeStamp: null
+                         name: amq-tcp-ingress-port
+                         namespace: $env
+                       spec:
+                         ports:
+                           - name: broker-amq-tcp
+                             nodeport: $nodeport
+                             port: 61618
+                             protocol: TCP
+                             targetPort: 61616
+                         selector:
+                           deploymentConfig: ${DEPLOY_NAME}
+                         sessionAffinity: None
+                         type: NodePort
+                       status:
+                         loadBalancer: {}"""
+           sh "echo '${json}' > /tmp/nodeport"
+           sh "oc apply -f /tmp/nodeport -n ${env}"
+         }
+
+         try {
+           timeout(time: 20, unit: 'MINUTES') {
+             node("maven") {
+             
+               stage ("DEV PROJECT DEPLOY") {
+                 deploy_and_createnodeport(${DEV_PROJECT}, ${DEV_PORT})
+               }
+
+               stage ("TEST PROJECT DEPLOY") {
+                 deploy_and_createnodeport(${TEST_PROJECT}, ${TEST_PORT})
+               }
+
+               stage ("STAGE PROJECT DEPLOY") {
+                 deploy_and_createnodeport(${STAGE_PROJECT}, ${STAGE_PORT})
+               }
+             }
+           }
+         } catch (err) {
+           echo "in catch block"
+           echo "Caught: ${err}"
+           throw err
+         }
+  triggers:
+    - github:
+        secret: secret101
+      type: GitHub
+    - generic:
+        secret: secret101
+      type: Generic
